@@ -4,24 +4,40 @@ import urllib3
 import random
 import os
 
-# Initialize AWS clients
+# CONFIGURATION (from environment variables)
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
-dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
-ses = boto3.client('ses', region_name=AWS_REGION)
-
-# CONFIGURATION (loaded from environment variables)
-OS_HOST = f"https://{os.environ['OPENSEARCH_HOST']}"
+OS_HOST = os.environ['OPENSEARCH_HOST']
 OS_INDEX = os.environ.get('OPENSEARCH_INDEX', 'restaurants')
 OS_AUTH = (os.environ['OPENSEARCH_USERNAME'], os.environ['OPENSEARCH_PASSWORD'])
 SENDER_EMAIL = os.environ['SENDER_EMAIL']
+SQS_QUEUE_URL = os.environ['SQS_QUEUE_URL']
+DYNAMODB_TABLE = os.environ.get('DYNAMODB_TABLE', 'yelp-restaurants')
 # -------------------------------------
+
+# Initialize AWS clients
+dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
+ses = boto3.client('ses', region_name=AWS_REGION)
+sqs = boto3.client('sqs', region_name=AWS_REGION)
 
 http = urllib3.PoolManager()
 
 def lambda_handler(event, context):
-    # SQS triggers pass messages in the 'Records' array
-    for record in event['Records']:
-        message_body = json.loads(record['body'])
+    # Actively poll SQS for new messages
+    response = sqs.receive_message(
+        QueueUrl=SQS_QUEUE_URL,
+        MaxNumberOfMessages=10, 
+        WaitTimeSeconds=2
+    )
+    
+    #If the queue is empty, exit
+    if 'Messages' not in response:
+        print("No new requests in queue. Waiting for next minute...")
+        return
+        
+    # Process the messages
+    for message in response['Messages']:
+        receipt_handle = message['ReceiptHandle']
+        message_body = json.loads(message['Body'])
         
         cuisine = message_body.get('Cuisine')
         location = message_body.get('Location')
@@ -32,6 +48,7 @@ def lambda_handler(event, context):
         
         if not cuisine or not user_email:
             print("Missing cuisine or email, skipping.")
+            sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
             continue
 
         cuisine_alias = cuisine.lower()
@@ -44,7 +61,6 @@ def lambda_handler(event, context):
         headers = urllib3.util.make_headers(basic_auth=f"{OS_AUTH[0]}:{OS_AUTH[1]}")
         headers['Content-Type'] = 'application/json'
         
-        # OpenSearch query URL (searching the 'Cuisine' field)
         search_url = f"{OS_HOST}/{OS_INDEX}/_search?q=Cuisine:{cuisine_alias}&size=20"
         
         try:
@@ -53,35 +69,40 @@ def lambda_handler(event, context):
             hits = os_data.get('hits', {}).get('hits', [])
             
             if not hits:
-                send_email(user_email, cuisine, time, num_people, [])
-                continue
+                send_email(user_email, cuisine, date, time, num_people, [])
+            else:
+                # Pick random restaurants from the hits (3 recommendations)
+                random.shuffle(hits)
+                selected_hits = hits[:3]
                 
-            # Pick random restaurants from the hits (3 recommendations)
-            random.shuffle(hits)
-            selected_hits = hits[:3]
-            
-            # Query DynamoDB for the full restaurant details
-            table = dynamodb.Table('yelp-restaurants')
-            recommendations = []
-            
-            for hit in selected_hits:
-                restaurant_id = hit['_source']['RestaurantID']
+                # Query DynamoDB for the full restaurant details
+                table = dynamodb.Table(DYNAMODB_TABLE)
+                recommendations = []
                 
-                # Fetch from DynamoDB
-                db_response = table.get_item(Key={'Business ID': restaurant_id})
-                if 'Item' in db_response:
-                    item = db_response['Item']
-                    name = item.get('Name', 'Unknown Name')
-                    address = item.get('Address', 'Unknown Address')
-                    recommendations.append(f"{name}, located at {address}")
+                for hit in selected_hits:
+                    restaurant_id = hit['_source']['RestaurantID']
+                    
+                    # Fetch from DynamoDB
+                    db_response = table.get_item(Key={'Business ID': restaurant_id})
+                    if 'Item' in db_response:
+                        item = db_response['Item']
+                        name = item.get('Name', 'Unknown Name')
+                        address = item.get('Address', 'Unknown Address')
+                        recommendations.append(f"{name}, located at {address}")
+                
+                # Send the Email via SES
+                send_email(user_email, cuisine, date, time, num_people, recommendations)
+                print(f"Successfully processed and emailed recommendations to {user_email}")
             
-            # Send the Email via SES
-            send_email(user_email, cuisine, date, time, num_people, recommendations)
-            print(f"Successfully processed and emailed recommendations to {user_email}")
+            # DELETE THE MESSAGE FROM SQS SO WE DON'T EMAIL THEM AGAIN!
+            sqs.delete_message(
+                QueueUrl=SQS_QUEUE_URL,
+                ReceiptHandle=receipt_handle
+            )
+            print("Message deleted from SQS successfully.")
             
         except Exception as e:
             print("Error processing recommendation:", str(e))
-            raise e
 
 def send_email(recipient, cuisine, date, time, num_people, recommendations):
     if not recommendations:

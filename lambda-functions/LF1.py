@@ -5,6 +5,7 @@ import os
 
 sqs = boto3.client('sqs')
 QUEUE_URL = os.environ['SQS_QUEUE_URL']
+HISTORY_TABLE = os.environ.get('DYNAMODB_HISTORY_TABLE', 'UserHistory')
 
 # VALIDATION LOGIC
 def validate_slots(slots):
@@ -120,7 +121,7 @@ def lambda_handler(event, context):
     if intent_name == 'GreetingIntent':
         if user_email:
             # Check DynamoDB 'UserHistory' table
-            history_table = boto3.resource('dynamodb').Table('UserHistory')
+            history_table = boto3.resource('dynamodb').Table(HISTORY_TABLE)
             response = history_table.get_item(Key={'Email': user_email}) 
             
             if 'Item' in response:
@@ -174,7 +175,7 @@ def handle_dining_suggestions(event):
             sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(sqs_message))
             
             # Initialize DynamoDB client and save the user's last search history
-            dynamo_history = boto3.resource('dynamodb').Table('UserHistory')
+            dynamo_history = boto3.resource('dynamodb').Table(HISTORY_TABLE)
             dynamo_history.put_item(
                 Item={
                     'Email': email,
@@ -195,7 +196,7 @@ def handle_repeat_search(event):
     user_email = event['sessionState'].get('sessionAttributes', {}).get('email')
 
     # Fetch past favorites from DynamoDB
-    history_table = boto3.resource('dynamodb').Table('UserHistory')
+    history_table = boto3.resource('dynamodb').Table(HISTORY_TABLE)
     response = history_table.get_item(Key={'Email': user_email})
     cuisine = response['Item']['LastCuisine']
     location = response['Item']['LastLocation']
